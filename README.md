@@ -2,7 +2,7 @@
 
 A robust, high-performance TCP tunneling solution written in Go, featuring a premium Web Dashboard, low-latency monitoring, and Windows Service support.
 
-![Tunnel Pro Dashboard]()
+![Tunnel Pro Dashboard](https://raw.githubusercontent.com/otkhotau/tunnel-local/refs/heads/main/tunnel.png)
 
 ## Features
 
