@@ -227,6 +227,9 @@ func (s *TunnelServer) handleClient(conn net.Conn) {
 	log.Printf("✅ Client %s (%s) v%s connected from %s", clientID, hostname, version, client.RemoteAddr)
 	s.addLog("INFO", fmt.Sprintf("Client %s (%s) v%s connected from %s", clientID, hostname, version, conn.RemoteAddr()))
 
+	// Auto-restore saved tunnel for this hostname
+	go s.autoRestoreTunnel(clientID, hostname)
+
 	go func() {
 		<-session.CloseChan()
 		s.removeClient(clientID)
@@ -376,6 +379,101 @@ func (s *TunnelServer) saveUpdateInfo() error {
 	}
 
 	return os.WriteFile(s.updateInfoFile, data, 0644)
+}
+
+// autoRestoreTunnel automatically restores saved tunnel for a client
+func (s *TunnelServer) autoRestoreTunnel(clientID, hostname string) {
+	// Wait a bit for client to fully connect
+	time.Sleep(2 * time.Second)
+
+	// Check if there's a saved mapping for this hostname
+	mapping := s.getPortMapping(hostname)
+	if mapping == nil {
+		return // No saved mapping
+	}
+
+	// Check if port is already in use
+	s.listMutex.Lock()
+	_, portInUse := s.listeners[mapping.Port]
+	s.listMutex.Unlock()
+
+	if portInUse {
+		log.Printf("⚠️ Port %s already in use, skipping auto-restore for %s", mapping.Port, hostname)
+		return
+	}
+
+	// Get client info
+	s.mutex.RLock()
+	client, ok := s.clients[clientID]
+	s.mutex.RUnlock()
+
+	if !ok {
+		return // Client disconnected already
+	}
+
+	log.Printf("🔄 Auto-restoring tunnel for %s: port %s → %s", hostname, mapping.Port, mapping.Target)
+	s.addLog("INFO", fmt.Sprintf("Auto-restoring tunnel for %s: port %s → %s", hostname, mapping.Port, mapping.Target))
+
+	// Open the tunnel
+	go func() {
+		ln, err := net.Listen("tcp", ":"+mapping.Port)
+		if err != nil {
+			log.Printf("❌ Failed to auto-restore port %s: %v", mapping.Port, err)
+			s.addLog("ERROR", fmt.Sprintf("Failed to auto-restore port %s: %v", mapping.Port, err))
+			return
+		}
+
+		s.listMutex.Lock()
+		s.listeners[mapping.Port] = ln
+		s.listenerMeta[mapping.Port] = mapping.Target
+		s.listMutex.Unlock()
+
+		log.Printf("✅ Auto-restored tunnel: 0.0.0.0:%s → %s", mapping.Port, mapping.Target)
+		s.addLog("INFO", fmt.Sprintf("Auto-restored tunnel: 0.0.0.0:%s → %s", mapping.Port, mapping.Target))
+
+		defer func() {
+			s.listMutex.Lock()
+			delete(s.listeners, mapping.Port)
+			delete(s.listenerMeta, mapping.Port)
+			s.listMutex.Unlock()
+			ln.Close()
+			log.Printf("🔌 Tunnel closed: port %s", mapping.Port)
+		}()
+
+		for {
+			userConn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			// Speed Tune User Connection - 8MB buffers
+			if tcpConn, ok := userConn.(*net.TCPConn); ok {
+				tcpConn.SetNoDelay(true)
+				tcpConn.SetReadBuffer(8 * 1024 * 1024)
+				tcpConn.SetWriteBuffer(8 * 1024 * 1024)
+			}
+
+			go func() {
+				stream, err := client.session.Open()
+				if err != nil {
+					userConn.Close()
+					return
+				}
+				stream.Write([]byte(mapping.Target + "\n"))
+
+				// Buffered Copy for Speed - 128KB buffers
+				buf1 := make([]byte, 128*1024)
+				buf2 := make([]byte, 128*1024)
+
+				go func() {
+					io.CopyBuffer(stream, userConn, buf1)
+					stream.Close()
+				}()
+				io.CopyBuffer(userConn, stream, buf2)
+				userConn.Close()
+			}()
+		}
+	}()
 }
 
 // --- Web Middleware ---
@@ -713,6 +811,9 @@ const dashboardHTML = `
             <a href="#" class="nav-item" onclick="showPage('logs'); return false;">
                 <span class="nav-icon">📄</span> Logs
             </a>
+            <a href="#" class="nav-item" onclick="showPage('updates'); return false;">
+                <span class="nav-icon">🔄</span> Updates
+            </a>
         </nav>
         <div style="flex:1"></div>
         <div class="nav-item" style="cursor: default;">
@@ -803,6 +904,82 @@ const dashboardHTML = `
                 </div>
             </div>
         </div>
+
+        <!-- Updates Page -->
+        <div id="page-updates" class="page">
+            <div class="header">
+                <h1>Client Updates</h1>
+            </div>
+            <div class="grid">
+                <!-- Current Update Info -->
+                <div class="card col-full">
+                    <div class="card-header">
+                        <h3>📦 Current Update</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="current-update-info">
+                            <div style="color: var(--text-muted); text-align: center; padding: 2rem;">
+                                No update available
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Upload New Update -->
+                <div class="card col-full">
+                    <div class="card-header">
+                        <h3>⬆️ Upload New Client Version</h3>
+                    </div>
+                    <div class="card-body">
+                        <form id="upload-form" onsubmit="uploadUpdate(event)" style="display: flex; flex-direction: column; gap: 1rem;">
+                            <div>
+                                <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Version *</label>
+                                <input type="text" id="update-version" placeholder="2.0.1" required 
+                                    style="width: 100%; padding: 0.75rem; background: var(--bg-input); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.9rem;">
+                            </div>
+                            <div>
+                                <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Description</label>
+                                <textarea id="update-description" placeholder="Bug fixes and improvements" rows="3"
+                                    style="width: 100%; padding: 0.75rem; background: var(--bg-input); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.9rem; resize: vertical;"></textarea>
+                            </div>
+                            <div>
+                                <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Client Binary (client.exe) *</label>
+                                <input type="file" id="update-binary" accept=".exe" required
+                                    style="width: 100%; padding: 0.75rem; background: var(--bg-input); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.9rem;">
+                                <div style="margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-muted);">
+                                    Max size: 50MB
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 1rem; align-items: center;">
+                                <button type="submit" class="btn-primary" id="upload-btn">
+                                    📤 Upload Update
+                                </button>
+                                <div id="upload-status" style="font-size: 0.9rem;"></div>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Instructions -->
+                <div class="card col-full">
+                    <div class="card-header">
+                        <h3>📚 How It Works</h3>
+                    </div>
+                    <div class="card-body">
+                        <ol style="line-height: 1.8; color: var(--text-muted);">
+                            <li><strong>Build</strong> new client: <code style="background: var(--bg-input); padding: 0.2rem 0.5rem; border-radius: 0.25rem;">go build -o client.exe client.go</code></li>
+                            <li><strong>Upload</strong> using the form above</li>
+                            <li><strong>Clients auto-check</strong> for updates every 30 minutes</li>
+                            <li><strong>Auto-download & install</strong> when new version detected</li>
+                            <li><strong>Auto-restart</strong> with new version</li>
+                        </ol>
+                        <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-input); border-radius: 0.5rem; border-left: 3px solid var(--primary);">
+                            <strong>💡 Tip:</strong> Clients will check for updates 10 seconds after startup, then every 30 minutes.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </main>
 
     <script>
@@ -841,6 +1018,9 @@ const dashboardHTML = `
                     if (document.getElementById('info-uptime')) {
                         document.getElementById('info-uptime').textContent = data.uptime || '-';
                     }
+
+                    // Update current update info
+                    renderUpdateInfo(data.update);
                     
                     // Update logs
                     if (data.logs && document.getElementById('log-content')) {
@@ -1014,6 +1194,95 @@ const dashboardHTML = `
         // Initialize
         updateStatus();
         setInterval(updateStatus, 2000);
+
+        // Render update info
+        function renderUpdateInfo(updateData) {
+            var container = document.getElementById('current-update-info');
+            if (!container) return;
+
+            if (!updateData || !updateData.version) {
+                container.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 2rem;">No update available</div>';
+                return;
+            }
+
+            var sizeInMB = (updateData.file_size / 1024 / 1024).toFixed(2);
+            container.innerHTML = 
+                '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">' +
+                    '<div>' +
+                        '<div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Version</div>' +
+                        '<div style="font-size: 1.25rem; font-weight: 600; color: var(--primary);">' + updateData.version + '</div>' +
+                    '</div>' +
+                    '<div>' +
+                        '<div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">File Size</div>' +
+                        '<div style="font-size: 1.25rem; font-weight: 600;">' + sizeInMB + ' MB</div>' +
+                    '</div>' +
+                    '<div>' +
+                        '<div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Uploaded</div>' +
+                        '<div style="font-size: 1.25rem; font-weight: 600;">' + updateData.upload_time + '</div>' +
+                    '</div>' +
+                '</div>' +
+                (updateData.description ? 
+                    '<div style="margin-top: 1rem; padding: 1rem; background: var(--bg-input); border-radius: 0.5rem;">' +
+                        '<div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem;">Description</div>' +
+                        '<div>' + updateData.description + '</div>' +
+                    '</div>' : '');
+        }
+
+        // Upload update
+        function uploadUpdate(event) {
+            event.preventDefault();
+
+            var version = document.getElementById('update-version').value;
+            var description = document.getElementById('update-description').value;
+            var fileInput = document.getElementById('update-binary');
+            var file = fileInput.files[0];
+
+            if (!file) {
+                alert('Please select a file');
+                return;
+            }
+
+            var statusDiv = document.getElementById('upload-status');
+            var uploadBtn = document.getElementById('upload-btn');
+
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = '⏳ Uploading...';
+            statusDiv.innerHTML = '<span style="color: var(--warning);">Uploading...</span>';
+
+            var formData = new FormData();
+            formData.append('version', version);
+            formData.append('description', description);
+            formData.append('binary', file);
+
+            fetch('/api/update/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(function(response) {
+                if (!response.ok) {
+                    return response.text().then(function(text) {
+                        throw new Error(text || 'Upload failed');
+                    });
+                }
+                return response.json();
+            })
+            .then(function(data) {
+                statusDiv.innerHTML = '<span style="color: var(--success);">✅ Upload successful! Version: ' + data.version + '</span>';
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = '📤 Upload Update';
+                
+                // Reset form
+                document.getElementById('upload-form').reset();
+                
+                // Refresh status to show new update
+                setTimeout(updateStatus, 1000);
+            })
+            .catch(function(error) {
+                statusDiv.innerHTML = '<span style="color: var(--danger);">❌ Error: ' + error.message + '</span>';
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = '📤 Upload Update';
+            });
+        }
     </script>
 </body>
 </html>

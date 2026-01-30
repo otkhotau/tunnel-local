@@ -29,8 +29,9 @@ type Config struct {
 }
 
 type program struct {
-	cfg  Config
-	exit chan struct{}
+	cfg       Config
+	exit      chan struct{}
+	isService bool // Track if running as service
 }
 
 var logger service.Logger
@@ -77,9 +78,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = s.Run()
-	if err != nil {
-		logger.Error(err)
+	// Detect if running as service
+	prg.isService = !service.Interactive()
+
+	err2 := s.Run()
+	if err2 != nil {
+		logger.Error(err2)
 	}
 }
 
@@ -329,13 +333,31 @@ func (p *program) performUpdateCheck() {
 	// Create update script
 	// On Windows, we need a batch script to replace the running exe
 	scriptPath := exePath + ".update.bat"
-	script := fmt.Sprintf(`@echo off
+
+	var script string
+	if p.isService {
+		// Running as service - restart service
+		script = fmt.Sprintf(`@echo off
+timeout /t 2 /nobreak > nul
+move /y "%s" "%s"
+del "%s"
+sc stop TunnelProClient
+timeout /t 2 /nobreak > nul
+sc start TunnelProClient
+del "%%~f0"
+`, tempPath, exePath, scriptPath)
+		logger.Info("📋 Update will restart Windows Service")
+	} else {
+		// Running as console - start console app
+		script = fmt.Sprintf(`@echo off
 timeout /t 2 /nobreak > nul
 move /y "%s" "%s"
 del "%s"
 start "" "%s" -s "%s" -t "%s" -l "%s"
 del "%%~f0"
 `, tempPath, exePath, scriptPath, exePath, p.cfg.ServerAddr, p.cfg.Token, p.cfg.DefaultLocalAddr)
+		logger.Info("📋 Update will restart Console App")
+	}
 
 	err = os.WriteFile(scriptPath, []byte(script), 0755)
 	if err != nil {
