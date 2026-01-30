@@ -2,16 +2,24 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/kardianos/service"
 )
+
+const CLIENT_VERSION = "2.0.0"
 
 // Config holds client configuration
 type Config struct {
@@ -87,7 +95,11 @@ func (p *program) Stop(s service.Service) error {
 
 func (p *program) run() {
 	logger.Info("🚀 Tunnel Service Started")
+	logger.Infof("Client Version: %s", CLIENT_VERSION)
 	logger.Infof("Target Server: %s", p.cfg.ServerAddr)
+
+	// Start update checker
+	go p.checkForUpdates()
 
 	backoff := time.Second
 	for {
@@ -126,7 +138,24 @@ func connectToServer(cfg Config) error {
 	}
 	defer conn.Close()
 
-	_, err = conn.Write([]byte(cfg.Token))
+	// Send token
+	_, err = conn.Write([]byte(cfg.Token + "\n"))
+	if err != nil {
+		return err
+	}
+
+	// Send hostname
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	_, err = conn.Write([]byte(hostname + "\n"))
+	if err != nil {
+		return err
+	}
+
+	// Send version
+	_, err = conn.Write([]byte(CLIENT_VERSION + "\n"))
 	if err != nil {
 		return err
 	}
@@ -134,7 +163,7 @@ func connectToServer(cfg Config) error {
 	// Yamux Speed Optimization
 	muxConfig := yamux.DefaultConfig()
 	muxConfig.KeepAliveInterval = 15 * time.Second
-	muxConfig.MaxStreamWindowSize = 1024 * 1024 // 1MB Window
+	muxConfig.MaxStreamWindowSize = 8 * 1024 * 1024 // 8MB Window (tăng từ 1MB)
 	muxConfig.ConnectionWriteTimeout = 10 * time.Second
 
 	session, err := yamux.Client(conn, muxConfig)
@@ -180,9 +209,9 @@ func handleStream(stream net.Conn, defaultLocalAddr string) {
 	}
 	defer localConn.Close()
 
-	// Use io.CopyBuffer for throughput
-	buf1 := make([]byte, 32*1024)
-	buf2 := make([]byte, 32*1024)
+	// Use io.CopyBuffer for throughput - 128KB buffers for 1Gbps
+	buf1 := make([]byte, 128*1024)
+	buf2 := make([]byte, 128*1024)
 
 	go func() {
 		io.CopyBuffer(localConn, reader, buf1) // Need to handle buffered reader
@@ -193,4 +222,133 @@ func handleStream(stream net.Conn, defaultLocalAddr string) {
 		// But we already used bufio to read the first line. We MUST read from 'reader'.
 	}()
 	io.CopyBuffer(stream, localConn, buf2)
+}
+
+func (p *program) checkForUpdates() {
+	// Check every 30 minutes
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	// Also check immediately on startup (after 10 seconds)
+	time.Sleep(10 * time.Second)
+	p.performUpdateCheck()
+
+	for {
+		select {
+		case <-p.exit:
+			return
+		case <-ticker.C:
+			p.performUpdateCheck()
+		}
+	}
+}
+
+func (p *program) performUpdateCheck() {
+	// Extract server address for HTTP
+	serverHost := strings.Split(p.cfg.ServerAddr, ":")[0]
+	// Assume web dashboard is on port 8081 (default)
+	updateURL := fmt.Sprintf("http://%s:8081/api/update/download?check=1", serverHost)
+
+	resp, err := http.Get(updateURL)
+	if err != nil {
+		// Server might not have update feature, silently ignore
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// No update available
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var updateInfo struct {
+		Version     string `json:"version"`
+		FileSize    int64  `json:"file_size"`
+		Description string `json:"description"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&updateInfo); err != nil {
+		return
+	}
+
+	// Compare versions
+	if updateInfo.Version == CLIENT_VERSION {
+		// Already up to date
+		return
+	}
+
+	logger.Infof("🔄 New update available: v%s (current: v%s)", updateInfo.Version, CLIENT_VERSION)
+	logger.Infof("📝 %s", updateInfo.Description)
+	logger.Info("⬇️ Downloading update...")
+
+	// Download update
+	downloadURL := fmt.Sprintf("http://%s:8081/api/update/download", serverHost)
+	resp, err = http.Get(downloadURL)
+	if err != nil {
+		logger.Errorf("Failed to download update: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Errorf("Failed to download update: HTTP %d", resp.StatusCode)
+		return
+	}
+
+	// Read new binary
+	newBinary, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Errorf("Failed to read update: %v", err)
+		return
+	}
+
+	logger.Infof("✅ Downloaded %d bytes", len(newBinary))
+
+	// Get current executable path
+	exePath, err := os.Executable()
+	if err != nil {
+		logger.Errorf("Failed to get executable path: %v", err)
+		return
+	}
+	exePath, _ = filepath.EvalSymlinks(exePath)
+
+	// Save new binary to temp file
+	tempPath := exePath + ".new"
+	err = os.WriteFile(tempPath, newBinary, 0755)
+	if err != nil {
+		logger.Errorf("Failed to write update: %v", err)
+		return
+	}
+
+	logger.Info("🔄 Installing update and restarting...")
+
+	// Create update script
+	// On Windows, we need a batch script to replace the running exe
+	scriptPath := exePath + ".update.bat"
+	script := fmt.Sprintf(`@echo off
+timeout /t 2 /nobreak > nul
+move /y "%s" "%s"
+del "%s"
+start "" "%s" -s "%s" -t "%s" -l "%s"
+del "%%~f0"
+`, tempPath, exePath, scriptPath, exePath, p.cfg.ServerAddr, p.cfg.Token, p.cfg.DefaultLocalAddr)
+
+	err = os.WriteFile(scriptPath, []byte(script), 0755)
+	if err != nil {
+		logger.Errorf("Failed to create update script: %v", err)
+		return
+	}
+
+	// Execute update script
+	cmd := exec.Command("cmd", "/c", scriptPath)
+	cmd.Start()
+
+	// Exit current process
+	logger.Info("👋 Exiting for update...")
+	close(p.exit)
+	os.Exit(0)
 }
